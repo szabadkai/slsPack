@@ -1,0 +1,36 @@
+{
+  "name": "slspack",
+  "version": "1.0.0",
+  "description": "Browser-based SLS packing and slicing prototype.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "keywords": [
+    "sls",
+    "packing",
+    "slicing",
+    "threejs",
+    "physics"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@vitejs/plugin-react": "^6.0.3",
+    "cannon-es": "^0.20.0",
+    "lucide-react": "^1.21.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "three": "^0.184.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.184.1"
+  }
+}
