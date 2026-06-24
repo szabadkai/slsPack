@@ -1,7 +1,8 @@
 import * as THREE from 'three';
-import type { LodLevel, ModelPart, RenderSettings } from './types';
+import type { CustomMeshData, LodLevel, ModelPart, RenderSettings } from './types';
 
 const edgeMaterial = new THREE.LineBasicMaterial({ color: '#046b9c', transparent: true, opacity: 0.28 });
+const uploadedGeometryCache = new WeakMap<CustomMeshData, THREE.BufferGeometry>();
 
 function createPartMaterial(isSelected: boolean, realisticShaders: boolean) {
   if (realisticShaders) {
@@ -41,6 +42,25 @@ function addEdges(mesh: THREE.Mesh, target: THREE.Group) {
   line.rotation.copy(mesh.rotation);
   line.scale.copy(mesh.scale);
   target.add(line);
+}
+
+function uploadedGeometryFor(meshData: CustomMeshData) {
+  const cached = uploadedGeometryCache.get(meshData);
+  if (cached) return cached;
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
+  if (meshData.normals) {
+    geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
+  } else {
+    geometry.computeVertexNormals();
+  }
+  if (meshData.indices) {
+    geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
+  }
+  geometry.userData.sharedUploadedGeometry = true;
+  uploadedGeometryCache.set(meshData, geometry);
+  return geometry;
 }
 
 function shell(model: ModelPart, material: THREE.Material, lodLevel: LodLevel) {
@@ -138,9 +158,7 @@ function bracket(model: ModelPart, material: THREE.Material, lodLevel: LodLevel)
 
 function uploaded(model: ModelPart, material: THREE.Material, lodLevel: LodLevel) {
   const group = new THREE.Group();
-  const geometry = new THREE.BufferGeometry();
   const meshData = model.customMesh;
-  const lod = lodSegments(lodLevel);
 
   if (!meshData) return bracket(model, material, lodLevel);
 
@@ -151,22 +169,8 @@ function uploaded(model: ModelPart, material: THREE.Material, lodLevel: LodLevel
     return group;
   }
 
-  geometry.setAttribute('position', new THREE.BufferAttribute(meshData.positions, 3));
-  if (meshData.normals) {
-    geometry.setAttribute('normal', new THREE.BufferAttribute(meshData.normals, 3));
-  } else {
-    geometry.computeVertexNormals();
-  }
-  if (meshData.indices) {
-    geometry.setIndex(new THREE.BufferAttribute(meshData.indices, 1));
-  }
-
-  const mesh = new THREE.Mesh(geometry, material);
+  const mesh = new THREE.Mesh(uploadedGeometryFor(meshData), material);
   group.add(mesh);
-
-  if (lod.edges && meshData.positions.length < lod.edgeLimit) {
-    addEdges(mesh, group);
-  }
 
   return group;
 }

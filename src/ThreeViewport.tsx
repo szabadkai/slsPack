@@ -221,10 +221,34 @@ function applyCulling(parts: THREE.Group | null, enabled: boolean) {
   });
 }
 
+function modelRenderSignature(model: ModelPart, isSelected: boolean, renderSettings: RenderSettings) {
+  const meshData = model.customMesh;
+  return [
+    model.kind,
+    model.source,
+    model.shape,
+    model.dims.map((value) => value.toFixed(4)).join(','),
+    model.radius.toFixed(4),
+    meshData ? `${meshData.positions.length}:${meshData.normals?.length ?? 0}:${meshData.indices?.length ?? 0}` : 'procedural',
+    renderSettings.lodLevel,
+    renderSettings.realisticShaders ? 'metal' : 'standard',
+    isSelected ? 'selected' : 'normal',
+  ].join('|');
+}
+
+function syncPartObject(object: THREE.Object3D, model: ModelPart, renderSettings: RenderSettings) {
+  object.position.set(...model.position);
+  object.quaternion.set(...model.quaternion);
+  object.visible = model.visible;
+  object.traverse((child) => {
+    child.frustumCulled = renderSettings.occlusionCulling;
+  });
+}
+
 function disposeObject(object: THREE.Object3D) {
   object.traverse((child) => {
     const mesh = child as THREE.Mesh | THREE.LineSegments;
-    if ('geometry' in mesh && mesh.geometry) mesh.geometry.dispose();
+    if ('geometry' in mesh && mesh.geometry && !mesh.geometry.userData.sharedUploadedGeometry) mesh.geometry.dispose();
     const material = 'material' in mesh ? mesh.material : undefined;
     if (!material) return;
     const materials = Array.isArray(material) ? material : [material];
@@ -462,17 +486,36 @@ export function ThreeViewport({
   useEffect(() => {
     const parts = partGroupRef.current;
     if (!parts) return;
-    parts.children.forEach(disposeObject);
-    parts.clear();
-    modelLookupRef.current.clear();
+    const seen = new Set<string>();
 
     models.forEach((model) => {
-      const object = createPartObject(model, model.id === selectedId, renderSettings);
-      object.traverse((child) => {
-        child.frustumCulled = renderSettings.occlusionCulling;
-      });
+      const isSelected = model.id === selectedId;
+      const signature = modelRenderSignature(model, isSelected, renderSettings);
+      const existing = modelLookupRef.current.get(model.id);
+      if (existing && existing.userData.modelSignature === signature) {
+        syncPartObject(existing, model, renderSettings);
+        seen.add(model.id);
+        return;
+      }
+
+      if (existing) {
+        parts.remove(existing);
+        disposeObject(existing);
+      }
+
+      const object = createPartObject(model, isSelected, renderSettings);
+      object.userData.modelSignature = signature;
+      syncPartObject(object, model, renderSettings);
       parts.add(object);
       modelLookupRef.current.set(model.id, object);
+      seen.add(model.id);
+    });
+
+    Array.from(modelLookupRef.current.entries()).forEach(([id, object]) => {
+      if (seen.has(id)) return;
+      parts.remove(object);
+      disposeObject(object);
+      modelLookupRef.current.delete(id);
     });
   }, [models, selectedId, buildVolume, renderSettings.realisticShaders, renderSettings.lodLevel, renderSettings.occlusionCulling]);
 

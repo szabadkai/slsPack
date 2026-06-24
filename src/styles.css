@@ -129,7 +129,7 @@ button {
   position: absolute;
   z-index: 4;
   left: 24px;
-  top: 112px;
+  top: 160px;
   min-width: 126px;
   border: 1px solid rgba(204, 214, 223, 0.78);
   border-radius: 6px;
@@ -170,15 +170,25 @@ button {
   box-shadow: 0 4px 10px rgba(34, 42, 53, 0.14);
 }
 
-.job-actions {
+.scene-controls {
   position: absolute;
-  z-index: 3;
+  z-index: 5;
   top: 22px;
   left: 24px;
+  right: 116px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.job-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  max-width: min(760px, calc(100% - 116px));
+  max-width: min(1260px, 100%);
+  pointer-events: auto;
 }
 
 .job-actions button {
@@ -207,10 +217,6 @@ button {
 }
 
 .status-pill {
-  position: absolute;
-  z-index: 3;
-  left: 24px;
-  top: 72px;
   height: 32px;
   border-radius: 18px;
   display: inline-flex;
@@ -220,6 +226,7 @@ button {
   color: #415063;
   font-weight: 700;
   font-size: 13px;
+  pointer-events: none;
 }
 
 .status-dot {
@@ -772,10 +779,16 @@ button {
     font-size: 15px;
   }
 
-  .job-actions {
+  .scene-controls {
     top: 10px;
     left: 10px;
+    right: 10px;
     gap: 8px;
+  }
+
+  .job-actions {
+    gap: 8px;
+    max-width: 100%;
   }
 
   .job-actions button {
@@ -784,15 +797,13 @@ button {
   }
 
   .status-pill {
-    top: 52px;
-    left: 10px;
     max-width: calc(100% - 20px);
     overflow: hidden;
     white-space: nowrap;
   }
 
   .fps-counter {
-    top: 92px;
+    top: 148px;
     left: 10px;
   }
 

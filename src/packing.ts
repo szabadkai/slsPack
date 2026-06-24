@@ -103,7 +103,7 @@ export function createGeneratedParts(count: number, seed: number, startIndex = 0
     const layer = Math.floor(index / (columns * columns));
     const x = -buildVolume.width / 2 + xStep * (column + 1) + randomBetween(rand, -0.35, 0.35);
     const z = -buildVolume.depth / 2 + zStep * (row + 1) + randomBetween(rand, -0.35, 0.35);
-    const y = 2.2 + layer * 3.2 + randomBetween(rand, -0.35, 0.35);
+    const y = height / 2 + 0.06 + layer * 3.2 + randomBetween(rand, 0, 0.08);
     const yaw = randomBetween(rand, -Math.PI, Math.PI);
     const pitch = randomBetween(rand, -0.45, 0.45);
     const roll = randomBetween(rand, -0.55, 0.55);
@@ -155,6 +155,53 @@ function createWall(
   return { body, basePosition };
 }
 
+function clampToRange(value: number, min: number, max: number) {
+  if (min > max) return (min + max) / 2;
+  return Math.min(Math.max(value, min), max);
+}
+
+function bodyMarginFor(model: ModelPart, buildVolume: BuildVolume) {
+  return {
+    x: Math.min(model.dims[0] * 0.5 + 0.03, Math.max(buildVolume.width / 2 - 0.05, 0)),
+    y: Math.min(model.dims[1] * 0.5 + 0.02, Math.max(buildVolume.height / 2 - 0.05, 0)),
+    z: Math.min(model.dims[2] * 0.5 + 0.03, Math.max(buildVolume.depth / 2 - 0.05, 0)),
+  };
+}
+
+function clampPositionInsideBuildVolume(position: Vec3Tuple, model: ModelPart, buildVolume: BuildVolume): Vec3Tuple {
+  const margin = bodyMarginFor(model, buildVolume);
+  return [
+    clampToRange(position[0], -buildVolume.width / 2 + margin.x, buildVolume.width / 2 - margin.x),
+    clampToRange(position[1], margin.y, buildVolume.height - margin.y),
+    clampToRange(position[2], -buildVolume.depth / 2 + margin.z, buildVolume.depth / 2 - margin.z),
+  ];
+}
+
+function keepBodyInsideBuildVolume(body: CANNON.Body, model: ModelPart, buildVolume: BuildVolume) {
+  const next = clampPositionInsideBuildVolume([body.position.x, body.position.y, body.position.z], model, buildVolume);
+  const movedX = Math.abs(next[0] - body.position.x) > 0.0001;
+  const movedY = Math.abs(next[1] - body.position.y) > 0.0001;
+  const movedZ = Math.abs(next[2] - body.position.z) > 0.0001;
+
+  if (!movedX && !movedY && !movedZ) return;
+
+  body.position.set(...next);
+  if (movedX) body.velocity.x = 0;
+  if (movedY) body.velocity.y = Math.min(body.velocity.y, 0);
+  if (movedZ) body.velocity.z = 0;
+  body.angularVelocity.scale(0.65, body.angularVelocity);
+  body.aabbNeedsUpdate = true;
+  body.wakeUp();
+}
+
+function keepBodiesInsideBuildVolume(bodies: CANNON.Body[], models: ModelPart[], buildVolume: BuildVolume, startIndex = 0) {
+  for (let index = startIndex; index < bodies.length; index += 1) {
+    const model = models[index];
+    if (!model) continue;
+    keepBodyInsideBuildVolume(bodies[index], model, buildVolume);
+  }
+}
+
 function dropStartForIndex(index: number, rand: () => number, buildVolume: BuildVolume): Vec3Tuple {
   const columns = 6;
   const rows = 5;
@@ -174,6 +221,16 @@ function dropStartForIndex(index: number, rand: () => number, buildVolume: Build
   ];
 }
 
+function dropPoseForModel(model: ModelPart, index: number, rand: () => number, buildVolume: BuildVolume) {
+  const position = clampPositionInsideBuildVolume(dropStartForIndex(index, rand, buildVolume), model, buildVolume);
+  const q = new CANNON.Quaternion();
+  q.setFromEuler(randomBetween(rand, -1.6, 1.6), randomBetween(rand, -Math.PI, Math.PI), randomBetween(rand, -1.6, 1.6), 'XYZ');
+  return {
+    position,
+    quaternion: [q.x, q.y, q.z, q.w] as QuatTuple,
+  };
+}
+
 function makeBody(
   model: ModelPart,
   rand: () => number,
@@ -182,13 +239,15 @@ function makeBody(
   start: 'drop' | 'current',
   buildVolume: BuildVolume,
   dropIndex = index,
+  forceStatic = false,
 ) {
   const [w, h, d] = model.dims;
   const body = new CANNON.Body({
-    mass: model.locked ? 0 : Math.max(0.32, model.volumeCc / 75),
+    mass: forceStatic || model.locked ? 0 : Math.max(0.32, model.volumeCc / 75),
     material,
     linearDamping: 0.36,
     angularDamping: 0.54,
+    allowSleep: forceStatic || model.locked,
     sleepSpeedLimit: 0.08,
     sleepTimeLimit: 0.4,
   });
@@ -203,11 +262,9 @@ function makeBody(
     body.position.set(...model.position);
     body.quaternion.set(...model.quaternion);
   } else {
-    const [x, y, z] = dropStartForIndex(dropIndex, rand, buildVolume);
-    const q = new CANNON.Quaternion();
-    q.setFromEuler(randomBetween(rand, -1.6, 1.6), randomBetween(rand, -Math.PI, Math.PI), randomBetween(rand, -1.6, 1.6), 'XYZ');
-    body.position.set(x, y, z);
-    body.quaternion.copy(q);
+    const pose = dropPoseForModel(model, dropIndex, rand, buildVolume);
+    body.position.set(...pose.position);
+    body.quaternion.set(...pose.quaternion);
   }
   return body;
 }
@@ -238,6 +295,49 @@ function buildFinalModels(models: ModelPart[], bodies: CANNON.Body[], buildVolum
       warnings: warning,
     };
   });
+}
+
+function hasHorizontalSupportOverlap(model: ModelPart, support: ModelPart) {
+  const xReach = (model.dims[0] + support.dims[0]) * 0.43;
+  const zReach = (model.dims[2] + support.dims[2]) * 0.43;
+  return Math.abs(model.position[0] - support.position[0]) < xReach && Math.abs(model.position[2] - support.position[2]) < zReach;
+}
+
+function groundUnsupportedModels(models: ModelPart[], fixedCount: number, buildVolume: BuildVolume) {
+  const grounded = models.map((model) => ({ ...model }));
+  const placed = grounded.slice(0, fixedCount);
+  const addedOrder = grounded
+    .slice(fixedCount)
+    .map((model, offset) => ({ model, index: fixedCount + offset }))
+    .sort((a, b) => a.model.position[1] - b.model.position[1]);
+
+  addedOrder.forEach(({ model, index }) => {
+    const halfHeight = model.dims[1] / 2;
+    const bottom = model.position[1] - halfHeight;
+    const supportTolerance = Math.max(0.55, Math.min(1.15, halfHeight * 0.72));
+    let targetY = halfHeight;
+    let closestSupportGap = Number.POSITIVE_INFINITY;
+
+    placed.forEach((support) => {
+      if (!hasHorizontalSupportOverlap(model, support)) return;
+      const supportTop = support.position[1] + support.dims[1] / 2;
+      const verticalGap = bottom - supportTop;
+      if (verticalGap < -0.42 || verticalGap > supportTolerance) return;
+      if (Math.abs(verticalGap) >= closestSupportGap) return;
+      closestSupportGap = Math.abs(verticalGap);
+      targetY = supportTop + halfHeight + 0.02;
+    });
+
+    const clampedY = Math.min(Math.max(targetY, halfHeight), buildVolume.height - halfHeight);
+    const corrected = {
+      ...model,
+      position: [model.position[0], clampedY, model.position[2]] as Vec3Tuple,
+    };
+    grounded[index] = corrected;
+    placed.push(corrected);
+  });
+
+  return grounded;
 }
 
 function shakeEnvelope(step: number, rampSteps: number, holdSteps: number, releaseSteps: number) {
@@ -292,7 +392,19 @@ function applyBuildVolumeShake(bodies: CANNON.Body[], step: number, fixedStep: n
   });
 }
 
-function createPackingWorld(settings: Pick<JobSettings, 'cageEnabled' | 'printer'>, options: { kinematicVolume?: boolean } = {}) {
+function applySettleGravityAssist(bodies: CANNON.Body[], startIndex: number, strength = 7.5) {
+  for (let index = startIndex; index < bodies.length; index += 1) {
+    const body = bodies[index];
+    if (body.mass <= 0) continue;
+    body.wakeUp();
+    body.applyForce(new CANNON.Vec3(0, -body.mass * strength, 0), body.position);
+  }
+}
+
+function createPackingWorld(
+  settings: Pick<JobSettings, 'cageEnabled' | 'printer'>,
+  options: { kinematicVolume?: boolean; solverIterations?: number } = {},
+) {
   const buildVolume = getBuildVolume(settings);
   const world = new CANNON.World({
     gravity: new CANNON.Vec3(0, -24, 0),
@@ -300,7 +412,7 @@ function createPackingWorld(settings: Pick<JobSettings, 'cageEnabled' | 'printer
   world.broadphase = new CANNON.SAPBroadphase(world);
   world.allowSleep = true;
   const solver = world.solver as CANNON.GSSolver;
-  solver.iterations = 18;
+  solver.iterations = options.solverIterations ?? 14;
   solver.tolerance = 0.001;
 
   const partMaterial = new CANNON.Material('nylon');
@@ -373,13 +485,14 @@ function createPackingWorld(settings: Pick<JobSettings, 'cageEnabled' | 'printer
 
 export function simulatePackingTimeline(models: ModelPart[], settings: Pick<JobSettings, 'seed' | 'cageEnabled' | 'printer'>): PackingSimulation {
   const rand = mulberry32(settings.seed + 911);
-  const { world, partMaterial, buildVolume, walls } = createPackingWorld(settings, { kinematicVolume: true });
+  const { world, partMaterial, buildVolume, walls } = createPackingWorld(settings, { kinematicVolume: true, solverIterations: 12 });
 
   const bodies = models.map((model, index) => {
     const body = makeBody(model, rand, index, partMaterial, 'drop', buildVolume);
     world.addBody(body);
     return body;
   });
+  keepBodiesInsideBuildVolume(bodies, models, buildVolume);
 
   const fixedStep = 1 / 60;
   const frames: PackingFrame[] = [createFrame(bodies, 'drop')];
@@ -388,12 +501,13 @@ export function simulatePackingTimeline(models: ModelPart[], settings: Pick<JobS
     moveBuildVolumeWalls(walls, buildVolumeShakeOffset(step, fixedStep, shake * 0.72), fixedStep);
     applyBuildVolumeShake(bodies, step, fixedStep, buildVolume, shake * 0.85);
     world.step(fixedStep);
+    keepBodiesInsideBuildVolume(bodies, models, buildVolume);
     if (step % 8 === 0 || step === 779) {
       frames.push(createFrame(bodies, step < 160 ? 'drop' : step < 420 ? 'shake' : 'settle'));
     }
   }
 
-  const finalModels = buildFinalModels(models, bodies, buildVolume);
+  const finalModels = groundUnsupportedModels(buildFinalModels(models, bodies, buildVolume), 0, buildVolume);
   frames.push({
     phase: 'settle',
     positions: finalModels.map((model) => model.position),
@@ -405,12 +519,13 @@ export function simulatePackingTimeline(models: ModelPart[], settings: Pick<JobS
 
 export function simulateShakeTimeline(models: ModelPart[], settings: Pick<JobSettings, 'seed' | 'cageEnabled' | 'printer'>): PackingSimulation {
   const rand = mulberry32(settings.seed + models.length * 17 + 3231);
-  const { world, partMaterial, buildVolume, walls } = createPackingWorld(settings, { kinematicVolume: true });
+  const { world, partMaterial, buildVolume, walls } = createPackingWorld(settings, { kinematicVolume: true, solverIterations: 12 });
   const bodies = models.map((model, index) => {
     const body = makeBody(model, rand, index, partMaterial, 'current', buildVolume);
     world.addBody(body);
     return body;
   });
+  keepBodiesInsideBuildVolume(bodies, models, buildVolume);
 
   const fixedStep = 1 / 60;
   const frames: PackingFrame[] = [createFrame(bodies, 'shake')];
@@ -419,12 +534,13 @@ export function simulateShakeTimeline(models: ModelPart[], settings: Pick<JobSet
     moveBuildVolumeWalls(walls, buildVolumeShakeOffset(step, fixedStep, shake), fixedStep);
     applyBuildVolumeShake(bodies, step, fixedStep, buildVolume, shake);
     world.step(fixedStep);
+    keepBodiesInsideBuildVolume(bodies, models, buildVolume);
     if (step % 6 === 0 || step === 559) {
       frames.push(createFrame(bodies, step < 420 ? 'shake' : 'settle'));
     }
   }
 
-  const finalModels = buildFinalModels(models, bodies, buildVolume);
+  const finalModels = groundUnsupportedModels(buildFinalModels(models, bodies, buildVolume), 0, buildVolume);
   frames.push({
     phase: 'settle',
     positions: finalModels.map((model) => model.position),
@@ -440,11 +556,12 @@ export function simulateDropInTimeline(
   settings: Pick<JobSettings, 'seed' | 'cageEnabled' | 'printer'>,
 ): PackingSimulation {
   const rand = mulberry32(settings.seed + existingModels.length * 43 + addedModels.length * 719 + 12007);
-  const { world, partMaterial, buildVolume, walls } = createPackingWorld(settings, { kinematicVolume: true });
+  const { world, partMaterial, buildVolume, walls } = createPackingWorld(settings, { kinematicVolume: true, solverIterations: 8 });
+  const simulationModels = [...existingModels, ...addedModels];
   const bodies: CANNON.Body[] = [];
 
   existingModels.forEach((model, index) => {
-    const body = makeBody(model, rand, index, partMaterial, 'current', buildVolume);
+    const body = makeBody(model, rand, index, partMaterial, 'current', buildVolume, index, true);
     body.velocity.set(0, 0, 0);
     body.angularVelocity.set(0, 0, 0);
     world.addBody(body);
@@ -458,20 +575,23 @@ export function simulateDropInTimeline(
     world.addBody(body);
     bodies.push(body);
   });
+  keepBodiesInsideBuildVolume(bodies, simulationModels, buildVolume, existingModels.length);
 
   const fixedStep = 1 / 60;
   const frames: PackingFrame[] = [createFrame(bodies, 'drop')];
-  for (let step = 0; step < 700; step += 1) {
-    const shake = step >= 170 && step < 540 ? shakeEnvelope(step - 170, 50, 170, 150) : 0;
+  for (let step = 0; step < 520; step += 1) {
+    const shake = step >= 130 && step < 420 ? shakeEnvelope(step - 130, 40, 130, 120) : 0;
     moveBuildVolumeWalls(walls, buildVolumeShakeOffset(step, fixedStep, shake * 0.85), fixedStep);
     applyBuildVolumeShake(bodies, step, fixedStep, buildVolume, shake * 0.9);
+    applySettleGravityAssist(bodies, existingModels.length, step < 120 ? 11 : 6);
     world.step(fixedStep);
-    if (step % 6 === 0 || step === 699) {
-      frames.push(createFrame(bodies, step < 260 ? 'drop' : step < 560 ? 'shake' : 'settle'));
+    keepBodiesInsideBuildVolume(bodies, simulationModels, buildVolume, existingModels.length);
+    if (step % 6 === 0 || step === 519) {
+      frames.push(createFrame(bodies, step < 210 ? 'drop' : step < 430 ? 'shake' : 'settle'));
     }
   }
 
-  const finalModels = buildFinalModels([...existingModels, ...addedModels], bodies, buildVolume);
+  const finalModels = groundUnsupportedModels(buildFinalModels(simulationModels, bodies, buildVolume), existingModels.length, buildVolume);
   frames.push({
     phase: 'settle',
     positions: finalModels.map((model) => model.position),
@@ -479,6 +599,57 @@ export function simulateDropInTimeline(
   });
 
   return { finalModels, frames };
+}
+
+export function createDropPreviewParts(
+  existingModels: ModelPart[],
+  addedModels: ModelPart[],
+  settings: Pick<JobSettings, 'seed' | 'printer'>,
+) {
+  const rand = mulberry32(settings.seed + existingModels.length * 43 + addedModels.length * 719 + 12007);
+  const buildVolume = getBuildVolume(settings);
+  return addedModels.map((model, index) => {
+    const pose = dropPoseForModel(model, index, rand, buildVolume);
+    return {
+      ...model,
+      position: pose.position,
+      quaternion: pose.quaternion,
+    };
+  });
+}
+
+export function createTemplateCopies(
+  template: ModelPart,
+  count: number,
+  seed: number,
+  startIndex = 0,
+  buildVolume: BuildVolume = BUILD_VOLUME,
+): ModelPart[] {
+  const rand = mulberry32(seed + startIndex * 67 + template.id.length * 17);
+  const copies: ModelPart[] = [];
+
+  for (let index = 0; index < count; index += 1) {
+    const partNumber = startIndex + index + 1;
+    const q = new CANNON.Quaternion();
+    q.setFromEuler(randomBetween(rand, -0.65, 0.65), randomBetween(rand, -Math.PI, Math.PI), randomBetween(rand, -0.65, 0.65), 'XYZ');
+    copies.push({
+      ...template,
+      id: `${template.source === 'uploaded' ? 'upload-copy' : 'part-copy'}-${partNumber}`,
+      name: `${template.name} (${partNumber})`,
+      visible: true,
+      locked: false,
+      selected: false,
+      position: [
+        randomBetween(rand, -buildVolume.width * 0.18, buildVolume.width * 0.18),
+        buildVolume.height - 2 - (index % 6) * 0.6,
+        randomBetween(rand, -buildVolume.depth * 0.18, buildVolume.depth * 0.18),
+      ],
+      quaternion: [q.x, q.y, q.z, q.w],
+      warnings: [],
+    });
+  }
+
+  return copies;
 }
 
 export function simulatePacking(models: ModelPart[], settings: Pick<JobSettings, 'seed' | 'cageEnabled' | 'printer'>) {
