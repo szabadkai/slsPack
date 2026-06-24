@@ -52,10 +52,10 @@ const PART_BATCH_SIZE = 30;
 const PRINTER_OPTIONS = Object.keys(PRINTER_SPECS) as PrinterModel[];
 
 type PackingWorkerSettings = Pick<JobSettings, 'seed' | 'cageEnabled' | 'printer'>;
+type PackingFrameSink = (frame: PackingFrame | null) => void;
 
-type PackingWorkerSimulation = {
+type PackingWorkerResult = {
   finalModels: ModelPart[];
-  frames: PackingFrame[];
 };
 
 type PackingWorkerPayload =
@@ -83,7 +83,11 @@ type PackingWorkerRequest = PackingWorkerPayload & {
 type PackingWorkerResponse =
   | {
       jobId: number;
-      simulation: PackingWorkerSimulation;
+      frame: PackingFrame;
+    }
+  | {
+      jobId: number;
+      finalModels: ModelPart[];
     }
   | {
       jobId: number;
@@ -464,15 +468,14 @@ export function App() {
   const [models, setModels] = useState(() => createJob(DEFAULT_SETTINGS));
   const [selectedId, setSelectedId] = useState<string | null>('part-19');
   const [status, setStatus] = useState('Ready');
-  const [packingFrames, setPackingFrames] = useState<PackingFrame[] | null>(null);
-  const [packingRunId, setPackingRunId] = useState(0);
+  const [isPackingJob, setIsPackingJob] = useState(false);
   const [isSummaryVisible, setIsSummaryVisible] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [renderSettings, setRenderSettings] = useState<RenderSettings>(DEFAULT_RENDER_SETTINGS);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const finalPackedModelsRef = useRef<ModelPart[] | null>(null);
   const packingWorkerRef = useRef<Worker | null>(null);
   const packingWorkerJobIdRef = useRef(0);
+  const packingFrameSinkRef = useRef<PackingFrameSink | null>(null);
   const importWorkerRef = useRef<Worker | null>(null);
   const importWorkerJobIdRef = useRef(0);
   const modelsRef = useRef<ModelPart[]>([]);
@@ -485,14 +488,7 @@ export function App() {
     const selected = models.find((model) => model.id === selectedId && model.source === 'uploaded');
     return selected ?? models.find((model) => model.source === 'uploaded') ?? null;
   }, [models, selectedId]);
-  const isPacking =
-    Boolean(packingFrames) ||
-    status.startsWith('Solving') ||
-    status.startsWith('Adding') ||
-    status.startsWith('Filling') ||
-    status.startsWith('Packing') ||
-    status.startsWith('Generating') ||
-    status.startsWith('Switching');
+  const isPacking = isPackingJob;
 
   const selectModel = useCallback((id: string) => {
     setSelectedId(id);
@@ -503,14 +499,14 @@ export function App() {
     settingsRef.current = settings;
   }, [models, settings]);
 
-  const runPackingWorker = useCallback((request: PackingWorkerPayload) => {
+  const runPackingWorker = useCallback((request: PackingWorkerPayload, onFrame: (frame: PackingFrame) => void) => {
     packingWorkerRef.current?.terminate();
     const worker = new Worker(new URL('./packingWorker.ts', import.meta.url), { type: 'module' });
     const jobId = packingWorkerJobIdRef.current + 1;
     packingWorkerJobIdRef.current = jobId;
     packingWorkerRef.current = worker;
 
-    return new Promise<PackingWorkerSimulation>((resolve, reject) => {
+    return new Promise<PackingWorkerResult>((resolve, reject) => {
       const cleanup = () => {
         worker.terminate();
         if (packingWorkerRef.current === worker) packingWorkerRef.current = null;
@@ -518,12 +514,17 @@ export function App() {
 
       worker.onmessage = (event: MessageEvent<PackingWorkerResponse>) => {
         if (event.data.jobId !== jobId) return;
-        cleanup();
         if ('error' in event.data) {
+          cleanup();
           reject(new Error(event.data.error));
           return;
         }
-        resolve(event.data.simulation);
+        if ('frame' in event.data) {
+          onFrame(event.data.frame);
+          return;
+        }
+        cleanup();
+        resolve({ finalModels: event.data.finalModels });
       };
 
       worker.onerror = (event) => {
@@ -574,49 +575,46 @@ export function App() {
     };
   }, []);
 
-  const startPackingPlayback = useCallback((sourceModels: ModelPart[], nextSettings: JobSettings, solvingStatus: string) => {
-    setPackingFrames(null);
-    setStatus(solvingStatus);
-    void runPackingWorker({ kind: 'pack', models: sourceModels, settings: nextSettings })
-      .then((simulation) => {
-        finalPackedModelsRef.current = simulation.finalModels;
-        setModels(sourceModels);
-        setPackingFrames(simulation.frames);
-        setPackingRunId((current) => current + 1);
-        setStatus('Dropping, colliding, shaking');
-      })
-      .catch((error) => {
-        finalPackedModelsRef.current = null;
-        setPackingFrames(null);
-        setStatus(error instanceof Error ? error.message : 'Packing simulation failed');
-      });
-  }, [runPackingWorker]);
+  const finishPackingRun = useCallback((finalModels: ModelPart[]) => {
+    packingFrameSinkRef.current?.(null);
+    setModels(finalModels);
+    setIsPackingJob(false);
+    setStatus('Packed and sliced');
+    setSelectedId((current) => current ?? finalModels[0]?.id ?? null);
+  }, []);
 
-  const startDropInPlayback = useCallback((existingModels: ModelPart[], addedModels: ModelPart[], nextSettings: JobSettings, solvingStatus: string) => {
+  const failPackingRun = useCallback((error: unknown) => {
+    packingFrameSinkRef.current?.(null);
+    setIsPackingJob(false);
+    setStatus(error instanceof Error ? error.message : 'Packing simulation failed');
+  }, []);
+
+  const startPackingLive = useCallback((sourceModels: ModelPart[], request: PackingWorkerPayload, runningStatus: string) => {
+    packingFrameSinkRef.current?.(null);
+    setModels(sourceModels);
+    setIsPackingJob(true);
+    setStatus(runningStatus);
+    void runPackingWorker(request, (frame) => {
+      packingFrameSinkRef.current?.(frame);
+    })
+      .then((result) => finishPackingRun(result.finalModels))
+      .catch(failPackingRun);
+  }, [failPackingRun, finishPackingRun, runPackingWorker]);
+
+  const startPackLive = useCallback((sourceModels: ModelPart[], nextSettings: JobSettings, runningStatus: string) => {
+    startPackingLive(sourceModels, { kind: 'pack', models: sourceModels, settings: nextSettings }, runningStatus);
+  }, [startPackingLive]);
+
+  const startDropInLive = useCallback((existingModels: ModelPart[], addedModels: ModelPart[], nextSettings: JobSettings, runningStatus: string) => {
     const previewParts = createDropPreviewParts(existingModels, addedModels, nextSettings);
     const sourceModels = [...existingModels, ...previewParts];
-    setPackingFrames(null);
-    setModels(sourceModels);
     setSelectedId(addedModels[0]?.id ?? existingModels[0]?.id ?? null);
-    setStatus(solvingStatus);
-    void runPackingWorker({ kind: 'dropIn', existingModels, addedModels, settings: nextSettings })
-      .then((simulation) => {
-        finalPackedModelsRef.current = simulation.finalModels;
-        setModels(sourceModels);
-        setPackingFrames(simulation.frames);
-        setPackingRunId((current) => current + 1);
-        setStatus(addedModels.length === 1 ? 'Dropping single part' : `Dropping ${addedModels.length} parts`);
-      })
-      .catch((error) => {
-        finalPackedModelsRef.current = null;
-        setPackingFrames(null);
-        setStatus(error instanceof Error ? error.message : 'Packing simulation failed');
-      });
-  }, [runPackingWorker]);
+    startPackingLive(sourceModels, { kind: 'dropIn', existingModels, addedModels, settings: nextSettings }, runningStatus);
+  }, [startPackingLive]);
 
   const runPack = useCallback(() => {
-    startPackingPlayback(models, settings, 'Solving fall and shake');
-  }, [models, settings, startPackingPlayback]);
+    startPackLive(models, settings, 'Packing in real time');
+  }, [models, settings, startPackLive]);
 
   const appendGeneratedParts = useCallback((requestedCount: number, solvingStatus: string) => {
     const addCount = Math.min(requestedCount, maxTotalPartCount - models.length);
@@ -624,8 +622,8 @@ export function App() {
     const nextSettings = { ...settings, partCount: settings.partCount + addCount };
     const addedParts = createGeneratedParts(addCount, nextSettings.seed + models.length * 97, models.length, buildVolume);
     setSettings(nextSettings);
-    startDropInPlayback(models, addedParts, nextSettings, solvingStatus);
-  }, [buildVolume, maxTotalPartCount, models, settings, startDropInPlayback]);
+    startDropInLive(models, addedParts, nextSettings, solvingStatus);
+  }, [buildVolume, maxTotalPartCount, models, settings, startDropInLive]);
 
   const addSinglePart = useCallback(() => {
     appendGeneratedParts(1, 'Adding one part');
@@ -646,12 +644,13 @@ export function App() {
     const nextSettings = { ...settings, partCount: settings.partCount + addCount };
     const addedParts = createTemplateCopies(uploadedFillTemplate, addCount, nextSettings.seed + models.length * 131, models.length, buildVolume);
     setSettings(nextSettings);
-    startDropInPlayback(models, addedParts, nextSettings, `Filling with ${uploadedFillTemplate.name}`);
-  }, [appendGeneratedParts, buildVolume, maxTotalPartCount, models, settings, startDropInPlayback, uploadedFillTemplate]);
+    startDropInLive(models, addedParts, nextSettings, `Filling with ${uploadedFillTemplate.name}`);
+  }, [appendGeneratedParts, buildVolume, maxTotalPartCount, models, settings, startDropInLive, uploadedFillTemplate]);
 
   const clearBuildVolume = useCallback(() => {
-    finalPackedModelsRef.current = null;
-    setPackingFrames(null);
+    packingWorkerRef.current?.terminate();
+    packingFrameSinkRef.current?.(null);
+    setIsPackingJob(false);
     setModels([]);
     setSelectedId(null);
     setSettings((current) => ({ ...current, partCount: 0 }));
@@ -669,7 +668,7 @@ export function App() {
     }
     const acceptedFiles = files.slice(0, openSlots);
     setIsImporting(true);
-    setPackingFrames(null);
+    packingFrameSinkRef.current?.(null);
     setStatus('Importing models in background');
     try {
       const imported = await runImportWorker(acceptedFiles, importModels.length, getBuildVolume(importSettings));
@@ -689,7 +688,7 @@ export function App() {
       const nextSettings = { ...currentSettings, partCount: currentSettings.partCount + importedForOpenSlots.length };
       setSettings(nextSettings);
       setSelectedId(importedForOpenSlots[0].id);
-      startDropInPlayback(
+      startDropInLive(
         currentModels,
         importedForOpenSlots,
         nextSettings,
@@ -701,33 +700,11 @@ export function App() {
     } finally {
       setIsImporting(false);
     }
-  }, [runImportWorker, startDropInPlayback]);
+  }, [runImportWorker, startDropInLive]);
 
   const shakeBuild = useCallback(() => {
-    setPackingFrames(null);
-    setStatus('Solving shake');
-    void runPackingWorker({ kind: 'shake', models, settings })
-      .then((simulation) => {
-        finalPackedModelsRef.current = simulation.finalModels;
-        setPackingFrames(simulation.frames);
-        setPackingRunId((current) => current + 1);
-        setStatus('Shaking build volume');
-      })
-      .catch((error) => {
-        finalPackedModelsRef.current = null;
-        setPackingFrames(null);
-        setStatus(error instanceof Error ? error.message : 'Packing simulation failed');
-      });
-  }, [models, runPackingWorker, settings]);
-
-  const completePackingPlayback = useCallback(() => {
-    const packed = finalPackedModelsRef.current;
-    if (!packed) return;
-    setModels(packed);
-    setPackingFrames(null);
-    setStatus('Packed and sliced');
-    setSelectedId((current) => current ?? packed[0]?.id ?? null);
-  }, []);
+    startPackingLive(models, { kind: 'shake', models, settings }, 'Shaking build volume');
+  }, [models, settings, startPackingLive]);
 
   const regenerate = () => {
     const nextSeed = settings.seed + 137;
@@ -735,7 +712,7 @@ export function App() {
     const nextModels = createJob(nextSettings);
     setSettings(nextSettings);
     setSelectedId(nextModels[0]?.id ?? null);
-    startPackingPlayback(nextModels, nextSettings, 'Generating new job');
+    startPackLive(nextModels, nextSettings, 'Generating new job');
   };
 
   const changePrinter = (printer: PrinterModel) => {
@@ -749,7 +726,7 @@ export function App() {
       sliceLayer: Math.min(nextLayerCount, Math.max(0, Math.round(layerFraction * nextLayerCount))),
     };
     setSettings(nextSettings);
-    startPackingPlayback(models, nextSettings, `Switching to ${printer}`);
+    startPackLive(models, nextSettings, `Switching to ${printer}`);
   };
 
   const toggleVisible = (id: string) => {
@@ -782,13 +759,11 @@ export function App() {
             selectedId={selectedId}
             sliceLayer={settings.sliceLayer}
             layerCount={metrics.layerCount}
-            showSlice={settings.showSlice && !packingFrames && !isPacking}
+            showSlice={settings.showSlice && !isPacking}
             buildVolume={buildVolume}
             renderSettings={renderSettings}
-            packingFrames={packingFrames}
-            packingRunId={packingRunId}
+            packingFrameSinkRef={packingFrameSinkRef}
             onSelectModel={selectModel}
-            onPackingPlaybackComplete={completePackingPlayback}
           />
           <div className="scene-controls">
             <div className="job-actions">

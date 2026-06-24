@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { createPartObject } from './geometry';
 import type { BuildVolume, ModelPart, PackingFrame, RenderSettings } from './types';
+
+type PackingFrameSink = (frame: PackingFrame | null) => void;
 
 interface ThreeViewportProps {
   models: ModelPart[];
@@ -13,10 +15,8 @@ interface ThreeViewportProps {
   showSlice: boolean;
   buildVolume: BuildVolume;
   renderSettings: RenderSettings;
-  packingFrames: PackingFrame[] | null;
-  packingRunId: number;
+  packingFrameSinkRef: RefObject<PackingFrameSink | null>;
   onSelectModel: (id: string) => void;
-  onPackingPlaybackComplete: () => void;
 }
 
 function pixelRatioFor(renderSettings: RenderSettings) {
@@ -264,10 +264,8 @@ export function ThreeViewport({
   showSlice,
   buildVolume,
   renderSettings,
-  packingFrames,
-  packingRunId,
+  packingFrameSinkRef,
   onSelectModel,
-  onPackingPlaybackComplete,
 }: ThreeViewportProps) {
   const [renderStats, setRenderStats] = useState({ fps: 0, calls: 0, triangles: 0 });
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -281,15 +279,20 @@ export function ThreeViewport({
   const partGroupRef = useRef<THREE.Group | null>(null);
   const sliceRef = useRef<THREE.Group | null>(null);
   const modelLookupRef = useRef(new Map<string, THREE.Object3D>());
-  const packingPlaybackRef = useRef<{
-    frames: PackingFrame[];
-    ids: string[];
-    startedAt: number | null;
-    completed: boolean;
-  } | null>(null);
-  const onPackingPlaybackCompleteRef = useRef(onPackingPlaybackComplete);
+  const modelIdsRef = useRef<string[]>(models.map((model) => model.id));
+  const pendingPackingFrameRef = useRef<PackingFrame | null>(null);
 
-  onPackingPlaybackCompleteRef.current = onPackingPlaybackComplete;
+  modelIdsRef.current = models.map((model) => model.id);
+
+  useEffect(() => {
+    const sink: PackingFrameSink = (frame) => {
+      pendingPackingFrameRef.current = frame;
+    };
+    packingFrameSinkRef.current = sink;
+    return () => {
+      if (packingFrameSinkRef.current === sink) packingFrameSinkRef.current = null;
+    };
+  }, [packingFrameSinkRef]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -375,49 +378,33 @@ export function ThreeViewport({
     resizeObserver.observe(container);
 
     let frame = 0;
-    const tempPositionA = new THREE.Vector3();
-    const tempPositionB = new THREE.Vector3();
-    const tempQuaternionA = new THREE.Quaternion();
-    const tempQuaternionB = new THREE.Quaternion();
     let fpsFrames = 0;
     let fpsStartedAt = 0;
+    let lastRenderedAt = 0;
+    const targetPosition = new THREE.Vector3();
+    const targetQuaternion = new THREE.Quaternion();
 
     const animate = (time: number) => {
       frame = requestAnimationFrame(animate);
       if (!fpsStartedAt) fpsStartedAt = time;
-      const playback = packingPlaybackRef.current;
-      if (playback) {
-        if (playback.startedAt === null) playback.startedAt = time;
-        const durationMs = Math.max(4600, playback.frames.length * 34);
-        const progress = Math.min((time - playback.startedAt) / durationMs, 1);
-        const frameIndex = progress * (playback.frames.length - 1);
-        const lowerIndex = Math.floor(frameIndex);
-        const upperIndex = Math.min(playback.frames.length - 1, lowerIndex + 1);
-        const t = frameIndex - lowerIndex;
-        const lowerFrame = playback.frames[lowerIndex];
-        const upperFrame = playback.frames[upperIndex];
-
-        lowerFrame.positions.forEach((position, index) => {
-          const id = playback.ids[index];
+      const packingFrame = pendingPackingFrameRef.current;
+      if (packingFrame) {
+        const deltaSeconds = lastRenderedAt ? (time - lastRenderedAt) / 1000 : 1 / 60;
+        const blend = Math.min(1, 1 - Math.exp(-deltaSeconds * 18));
+        packingFrame.positions.forEach((position, index) => {
+          const id = modelIdsRef.current[index];
           if (!id) return;
           const object = modelLookupRef.current.get(id);
           if (!object) return;
-          const upperPosition = upperFrame.positions[index] ?? position;
-          const quaternion = lowerFrame.quaternions[index];
-          const upperQuaternion = upperFrame.quaternions[index] ?? quaternion;
-          tempPositionA.set(...position);
-          tempPositionB.set(...upperPosition);
-          object.position.lerpVectors(tempPositionA, tempPositionB, t);
-          tempQuaternionA.set(...quaternion);
-          tempQuaternionB.set(...upperQuaternion);
-          object.quaternion.copy(tempQuaternionA.slerp(tempQuaternionB, t));
+          targetPosition.set(...position);
+          object.position.lerp(targetPosition, blend);
+          const quaternion = packingFrame.quaternions[index];
+          if (!quaternion) return;
+          targetQuaternion.set(...quaternion);
+          object.quaternion.slerp(targetQuaternion, blend);
         });
-
-        if (progress >= 1 && !playback.completed) {
-          playback.completed = true;
-          window.setTimeout(() => onPackingPlaybackCompleteRef.current(), 0);
-        }
       }
+      lastRenderedAt = time;
       controls.update();
       renderer.render(scene, camera);
       fpsFrames += 1;
@@ -459,29 +446,6 @@ export function ThreeViewport({
     if (hemiRef.current) hemiRef.current.intensity = renderSettings.realisticShaders ? 1.65 : 2.4;
     if (keyRef.current) keyRef.current.intensity = renderSettings.realisticShaders ? 3.2 : 2.6;
   }, [renderSettings.rasterResolution, renderSettings.realisticShaders]);
-
-  useEffect(() => {
-    if (!packingFrames?.length) {
-      packingPlaybackRef.current = null;
-      return;
-    }
-    packingPlaybackRef.current = {
-      frames: packingFrames,
-      ids: models.map((model) => model.id),
-      startedAt: null,
-      completed: false,
-    };
-
-    const fallbackMs = Math.max(4600, packingFrames.length * 34) + 900;
-    const fallback = window.setTimeout(() => {
-      const playback = packingPlaybackRef.current;
-      if (!playback || playback.completed || playback.frames !== packingFrames) return;
-      playback.completed = true;
-      onPackingPlaybackCompleteRef.current();
-    }, fallbackMs);
-
-    return () => window.clearTimeout(fallback);
-  }, [packingFrames, packingRunId, models]);
 
   useEffect(() => {
     const parts = partGroupRef.current;

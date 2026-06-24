@@ -1,9 +1,11 @@
 import {
-  simulateDropInTimeline,
-  simulatePackingTimeline,
-  simulateShakeTimeline,
+  generateDropInTimeline,
+  generatePackingTimeline,
+  generateShakeTimeline,
 } from './packing';
-import type { JobSettings, ModelPart, PackingSimulation } from './types';
+import type { JobSettings, ModelPart, PackingFrame } from './types';
+
+const LIVE_FRAME_DELAY_MS = 16;
 
 type WorkerSettings = Pick<JobSettings, 'seed' | 'cageEnabled' | 'printer'>;
 
@@ -31,28 +33,47 @@ type PackingWorkerRequest =
 type PackingWorkerResponse =
   | {
       jobId: number;
-      simulation: PackingSimulation;
+      frame: PackingFrame;
+    }
+  | {
+      jobId: number;
+      finalModels: ModelPart[];
     }
   | {
       jobId: number;
       error: string;
     };
 
+function waitForLiveFrame() {
+  return new Promise((resolve) => {
+    self.setTimeout(resolve, LIVE_FRAME_DELAY_MS);
+  });
+}
+
 self.onmessage = (event: MessageEvent<PackingWorkerRequest>) => {
   const request = event.data;
-  try {
-    const simulation =
-      request.kind === 'pack'
-        ? simulatePackingTimeline(request.models, request.settings)
-        : request.kind === 'shake'
-          ? simulateShakeTimeline(request.models, request.settings)
-          : simulateDropInTimeline(request.existingModels, request.addedModels, request.settings);
+  void (async () => {
+    try {
+      const timeline =
+        request.kind === 'pack'
+          ? generatePackingTimeline(request.models, request.settings)
+          : request.kind === 'shake'
+            ? generateShakeTimeline(request.models, request.settings)
+            : generateDropInTimeline(request.existingModels, request.addedModels, request.settings);
 
-    self.postMessage({ jobId: request.jobId, simulation } satisfies PackingWorkerResponse);
-  } catch (error) {
-    self.postMessage({
-      jobId: request.jobId,
-      error: error instanceof Error ? error.message : 'Packing simulation failed',
-    } satisfies PackingWorkerResponse);
-  }
+      let next = timeline.next();
+      while (!next.done) {
+        self.postMessage({ jobId: request.jobId, frame: next.value } satisfies PackingWorkerResponse);
+        await waitForLiveFrame();
+        next = timeline.next();
+      }
+
+      self.postMessage({ jobId: request.jobId, finalModels: next.value } satisfies PackingWorkerResponse);
+    } catch (error) {
+      self.postMessage({
+        jobId: request.jobId,
+        error: error instanceof Error ? error.message : 'Packing simulation failed',
+      } satisfies PackingWorkerResponse);
+    }
+  })();
 };
